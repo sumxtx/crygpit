@@ -1,22 +1,33 @@
-# Implementation Plan (v5, Rust): Crygpit — Zero-Metadata Encrypted Mirrors
+# Implementation Plan (v6, Rust): Crygpit — Zero-Metadata Encrypted Mirrors
 
-## 0. Goal
+## 0. Goal & Threat Model
 
-GitHub sees **one opaque blob**. Everything else is inside the encryption and visible only to people who can decrypt: file names, history, commit messages, contributors, member keys, the project name and the config.
+GitHub (and anyone with read or push access to the outer repo) should learn **nothing** except that encrypted blobs exist. Only members can see the history, files, contributors, member keys and config.
 
-## 1. Layout
+| Adversary | Can | Must NOT be able to |
+| :--- | :--- | :--- |
+| GitHub / public reader | Read outer repo | Learn contents, names, members, or key IDs |
+| Outsider with outer push access | Replace or delete blobs | Get members to accept forged or old content, or add a recipient |
+| Malicious member | Push valid vaults | Run code on other members' machines, or add members silently |
+| Removed member | Keep old clones | Read anything pushed after removal |
+
+## 1. Local Layout
 
 `crygpit init ~/code/project` →
 
 ```
 ~/code/project.crypt/
-├── .git/                OUTER repo → GitHub
-├── .gitignore       ✔   allow-list (only the files marked ✔)
-├── vault.gpg        ✔   the only content GitHub sees (generic name, no project name)
-├── .crygpit/            LOCAL only, ignored
-│   ├── state.toml       last plaintext hash, lock
-│   └── cache/           decrypted copy of meta (members, config)
-└── project/             INNER repo, plaintext, NO remote, ignored by outer
+├── .git/                    OUTER repo → GitHub (linear history, never merged)
+├── .gitignore           ✔   allow-list
+├── vault/               ✔   encrypted segments (only content GitHub sees)
+│   └── 000001.gpg
+├── .crygpit/                LOCAL only, ignored
+│   ├── local.toml           signing key, vault dir name, prefs
+│   ├── trust.toml           pinned member fingerprints (TOFU), last accepted seq + chain hash
+│   ├── keyring.kbx          project-local public keyring (members' keys)
+│   ├── state.toml           last pushed fingerprint (refs + meta hash)
+│   └── lock
+└── project/                 INNER repo, plaintext, NO remote, ignored by outer
     ├── .git/
     └── src/ ...
 ```
@@ -25,161 +36,212 @@ Outer `.gitignore`:
 ```
 *
 !.gitignore
-!vault.gpg
+!vault/
+!vault/*.gpg
 ```
 
-## 2. What's Inside `vault.gpg` (encrypted payload)
+## 2. Segment Format (`vault/NNNNNN.gpg`)
 
 ```
-tar root
-├── .crygpit-meta/
-│   ├── config.toml       name = "project", extra_ignore, pad, date_mode ...
-│   ├── members.toml      [[member]] fingerprint, label ("alice@…"), added_by, added_at
-│   └── keys/
-│       ├── <FPR_A>.asc   exported PUBLIC keys of every member
-│       └── <FPR_B>.asc
-├── .crygpit-pad          random padding (see §5)
-└── project/              the project, incl. project/.git
+gpg --sign --encrypt --throw-keyids -z 0
+└── tar (normalized headers: uid/gid 0, no uname, mtime 0, sorted)
+    ├── meta.toml           seq, prev_hash, kind = "full"|"incremental"(phase 2),
+    │                       base_seq, bundle_sha256, created_at, crygpit version
+    ├── members.toml        [[member]] fpr, label, added_by, added_at
+    │                       [[removed]] fpr, removed_by, removed_at
+    ├── config.toml         name, extra_ignore, pad, date_mode
+    ├── keys/<FPR>.asc      public keys of all current members
+    ├── repo.bundle         git bundle of refs/heads/* + refs/tags/* (objects + refs only)
+    └── pad                 random bytes (Padmé)
 ```
 
-Every member who decrypts gets the full recipient list **and** their public keys, so they can re-encrypt for everyone on their next push without any out-of-band key exchange.
+Why each piece is there:
+- **Git bundle, not raw `.git`.** No hooks, config, index, reflog or local paths ever cross machines. Git alone decides what's included, so tracked files are never dropped.
+- **Sign then encrypt.** The signer is authenticated, and their identity stays hidden inside the ciphertext.
+- **`seq` + `prev_hash`.** Rollback protection (§5).
+- **No extra compression.** Bundle objects are already zlib-compressed, and GPG compression is off (`-z 0`), so the size depends only on the padding bucket.
+- **Padmé padding.** The size leaks only about log-log bits, with at most ~12% overhead (vs up to 100% for power-of-two).
 
-## 3. Multiple Recipients (how PGP does it)
+## 3. Multiple Recipients
 
-PGP is hybrid encryption, and multiple recipients are built in:
-1. A random **session key** encrypts the data once (AES).
-2. The session key is encrypted separately to each recipient's public key, giving one small header packet per recipient.
-3. Any one recipient's private key unlocks the session key, and with it the whole file.
+PGP is hybrid: one random session key encrypts the data, and that session key is wrapped once per recipient (one anonymous header packet each with `--throw-keyids`). Any single recipient's private key decrypts the file.
 
-```
-gpg -e --throw-keyids -r FPR_A -r FPR_B -r FPR_C
-```
-Verified locally: 3 anonymous header packets (`keyid 0000000000000000`), and Bob alone can decrypt.
-
-Crygpit rules:
-- Recipients = all fingerprints in `members.toml`, **always plus your own key** (otherwise you'd lock yourself out).
-- Before each push, check that every recipient key is present, not expired, not revoked and can encrypt. Abort if any fails.
-- Always use full fingerprints, never short IDs.
+- Recipients = all current members, **always plus yourself**.
+- Encryption uses the project-local keyring with explicit full fingerprints and `--trust-model always`. Crygpit enforces trust through fingerprint pinning (§5), so gpg's web-of-trust prompts don't block it. Members' keys are not added to your main keyring.
+- Before every push, check that each recipient key exists, isn't expired or revoked, and can encrypt.
 
 ## 4. Members
 
 | Command | Behavior |
 | :--- | :--- |
-| `crygpit member add <key.asc \| FPR>` | Imports the key, adds it to `members.toml`, copies the public key into `keys/`. Takes effect on next push. |
-| `crygpit member rm <FPR>` | Removes the member; the next push re-encrypts without them. |
-| `crygpit member ls` | Lists members (from the decrypted meta cache). |
+| `crygpit member add <key.asc \| FPR> [--label L]` | Pins the key locally and adds it to `members.toml` + `keys/`. Takes effect on next push. |
+| `crygpit member rm <FPR>` | Moves it to `[[removed]]`; the next push excludes that key. |
+| `crygpit member ls` | Current and removed members, with who changed what and when. |
 
 > [!WARNING]
-> Removal is not retroactive. A removed member can still decrypt every **older** `vault.gpg` in git history, and may already have cloned it. Treat removal as "no future access" and rotate any secrets the project contains.
+> Removal only blocks **future** pushes. A removed member can still decrypt older segments in git history and may already have clones. Rotate any secrets stored in the project.
 
-## 5. Metadata Hardening
+## 5. Authentication & Trust (fixes forgery / rollback)
 
-| Leak | Mitigation | Default |
-| :--- | :--- | :--- |
-| Recipient key IDs in header | `--throw-keyids` | **on** (always) |
-| Recipients/config in a committed file | Moved inside the payload (§2) | on |
-| Project name in filename | Fixed name `vault.gpg` | on |
-| Outer commit author/email | `crygpit <crygpit@invalid>` via `GIT_AUTHOR_*`/`GIT_COMMITTER_*` | on |
-| Outer commit message | Constant `update` | on |
-| Outer commit dates | `date_mode = fixed` (constant date) \| `day` (rounded) \| `real` | `fixed` |
-| Exact payload size | Pad the plaintext up to a bucket (`pad = "pow2"` \| `"1MiB"` \| `"none"`) | `pow2` |
-| Compression ratio side-channel | GPG compression off (`-z 0`), so the ciphertext size depends only on the padded bucket. The trade-off is a bigger vault; optional zstd *before* padding could come later | on |
-| Inner commits leaking via outer | Never copied; outer is fully generic | on |
+On every decrypt (clone, pull, push-after-fetch, ls, extract):
 
-### What can NOT be hidden (residual leaks)
+1. **Decrypt success** is decided from `--status-fd`: requires `DECRYPTION_OKAY` and integrity OK, and no `DECRYPTION_FAILED`. The exit code is ignored, because with `--throw-keyids` gpg returns rc=2 even on success (verified).
+2. **Signature required:** `GOODSIG` + `VALIDSIG`. The signer's primary fingerprint (last field of `VALIDSIG`) must be in `trust.toml`. Reject on `BADSIG`, `ERRSIG`, `REVKEYSIG`, `NO_PUBKEY`, or an unsigned payload. `EXPKEYSIG` gives a warning plus confirmation.
+3. **Member changes** compared with `trust.toml` are shown as a diff and need explicit confirmation (`--accept-members` for scripts). Removals are accepted automatically, since they only reduce trust.
+4. **Rollback / replay protection:** `seq` must be greater than the last accepted `seq`, and `prev_hash` must equal the hash of the last accepted segment. Otherwise reject with "vault rolled back or forked".
+5. **First clone (TOFU):** shows the signer and the member list with fingerprints, and asks for confirmation. Only after that is anything pinned. `--expect-signer FPR` lets you verify out-of-band without a prompt.
 
-| Still visible on GitHub | Why / possible mitigation |
+Residual risk: a "freeze" (an attacker deletes new pushes so you keep seeing old state) can't be prevented without an out-of-band channel. `status` shows the last accepted `seq` and its date so members can compare.
+
+## 6. Metadata Hardening
+
+| Leak | Mitigation |
 | :--- | :--- |
-| **Number of recipients** | One header packet each. Optional later: `decoys = N`, extra throwaway recipient keys to round the count up. |
-| Cipher/algorithm family (e.g. ECDH) | Part of the OpenPGP format. |
-| Approximate size (bucket) | Reduced by padding, not eliminated. |
-| Number and timing of pushes | GitHub logs push events, whatever the commit dates say. |
-| The GitHub account and repo name | Your choice: use a neutral repo name, or a dedicated account / deploy key. |
+| Recipient key IDs | `--throw-keyids` (always) |
+| Signer identity | Signature is inside the encryption |
+| Members / config / project name | Inside the payload only. Nothing committed in plaintext. |
+| Outer commit author / email | `crygpit <crygpit@invalid>` via `GIT_AUTHOR_*` / `GIT_COMMITTER_*` |
+| Outer commit message | Constant `update` |
+| Outer commit dates | `date_mode = fixed` (default) \| `day` \| `real` |
+| Exact size | Padmé padding |
+| Tool fingerprint | Vault dir name configurable at `init` (`--vault-dir`). `clone` discovers it from the `.gitignore` allow-list. |
 
-## 6. CLI
+**Cannot be hidden:** the number of recipients (one header packet each; optional decoys later), the OpenPGP algorithm family, approximate size, the number and timing of pushes, and the GitHub account and repo name.
+
+## 7. CLI
 
 | Command | Behavior |
 | :--- | :--- |
-| `crygpit init <path> [--remote URL] [--member FPR...]` | Creates `<path>.crypt/` and moves `<path>` into it. `git init`s inner if needed and writes default ignores to inner `.git/info/exclude`. Creates the meta with yourself as first member. Sets up outer repo + remote, does a first push. |
-| `crygpit push [-m MSG]` | Inner auto-commit if dirty (`MSG` or `crygpit: snapshot <ts>`), then pack → pad → encrypt to all members. Skips if the plaintext hash is unchanged. Outer generic commit, then push. |
-| `crygpit clone <remote> [dest]` | Clones, decrypts (gpg tries all your secret keys), shows the members and imports their public keys after confirmation (`--yes` to skip). Extracts `project/` and caches the meta. |
-| `crygpit pull` | Outer pull, then decrypt to a temp dir. Inner auto-commits local work, then `git fetch <tmp>` and fast-forwards or merges. Updates the meta cache and imports new member keys (with confirmation). Aborts on conflict. |
-| `crygpit ls` / `extract <file> [-o dir]` | Streamed decrypt; nothing written to disk except the requested file. |
-| `crygpit status` | Inner dirty? Changed since push? Outer ahead/behind? Any member keys missing or expired? |
+| `crygpit init <path> [--remote URL] [--member FPR...] [--vault-dir D] [--yes]` | Transactional (§9). Shows the default ignores for confirmation, creates the layout, signs and pushes the first full segment. |
+| `crygpit push [-m MSG]` | §8 push algorithm. |
+| `crygpit clone <remote> [dest] [--expect-signer FPR]` | Clones the outer repo, verifies the latest segment (TOFU), fetches the bundle into a fresh inner repo, checks out the default branch, pins the members. |
+| `crygpit pull` | Outer fetch, then verify the new segments and merge inner (§8). |
+| `crygpit ls [--ref R]` | Decrypts into a temp bare repo in `$XDG_RUNTIME_DIR` (tmpfs) and runs `git ls-tree -r`. Deleted afterwards. |
+| `crygpit extract <file> [--ref R] [-o dir]` | Same, using `git show R:file`. Works without a full checkout. |
+| `crygpit status` | Inner dirty / unpushed, outer ahead/behind, last accepted seq and date, key health. |
 | `crygpit member add/rm/ls` | §4 |
-| `crygpit unwrap` | Moves `project/` back out next to `project.crypt/`. |
+| `crygpit doctor` | Checks gpg/git versions, signing key, whether the agent can sign without a TTY, recipient key validity, the remote, and segment size limits. |
+| `crygpit unwrap` | Moves `project/` back next to `project.crypt/`. |
 
-## 7. Ignore Rules (builds / dependencies)
+## 8. Core Algorithms
 
-These defaults are written at `init` into the inner `project/.git/info/exclude`. Your tracked `.gitignore` stays untouched, and the excludes travel inside the vault.
+### Change detection
+`fingerprint = sha256(sorted "git for-each-ref refs/heads refs/tags" output + HEAD symref + hash(members, config))`.
+This is compared with `state.toml`. Index and stat noise is ignored, so plain `git status` doesn't count as a change.
+
+### Push (fetch → merge → repack → retry; outer is never merged)
 ```
-node_modules/ target/ dist/ build/ out/ .next/ .nuxt/ .venv/ venv/
-__pycache__/ *.pyc .tox/ .mypy_cache/ .pytest_cache/ vendor/ .gradle/
-.idea/ .vscode/ *.log .DS_Store
+lock
+inner: if dirty → git add -A && git commit (MSG | "crygpit: snapshot <ts>")
+loop (max 5 attempts):
+    outer: git fetch
+    if remote has segments newer than our last accepted seq:
+        verify (§5) → fetch bundle into refs/crygpit/incoming/* → merge inner (below)
+        on conflict → stop, leave the inner repo in normal merge state, tell user to resolve and re-run push
+    if fingerprint unchanged and nothing new → exit "up to date"
+    build segment (seq = last+1, prev_hash = hash(last)) → sign+encrypt → vault/NNNNNN.gpg.tmp → rename
+    outer: commit on top of origin head (anonymized) → git push (no force)
+    if push rejected (someone pushed in between) → reset outer to origin, continue loop
+update state.toml + trust.toml, unlock
 ```
-On top of these come the project's `.gitignore` and `config.toml: extra_ignore`. The same rules apply to the inner auto-commit **and** the tar walk. `project/.git/` is always included.
 
-## 8. Pipelines
+### Inner merge (pull and push)
+- The bundle is fetched into `refs/crygpit/incoming/heads/*` and `tags/*`. Hooks are never involved, because it's a plain `git fetch` from a file.
+- **Current branch:** fast-forward if possible, otherwise `git merge` (a normal merge commit). On conflicts, the usual git conflict state is left for the user.
+- **Other branches:** fast-forward if possible. If they diverged, keep the incoming version as `refs/crygpit/incoming/...` and report it.
+- **New branches/tags:** created. Tags that conflict with local ones: keep local and warn.
+- Local uncommitted work is auto-committed before merging.
 
-**Push:**
+## 9. Transactional `init`
+
+1. **Validate everything first:** the path exists, `<path>.crypt` doesn't, the path isn't nested in another `.crypt`, the source and its parent are on the same filesystem, the inner repo has no remote (unless `--allow-remote`), the signing key works, the recipient keys are valid, and the remote is reachable (if given).
+2. Build the outer skeleton in a sibling temp dir `<path>.crypt.tmp-XXXX`.
+3. `rename(<path>, tmp/project)`, then `git init` the inner repo if needed and write the confirmed excludes.
+4. Create the first segment and the outer commit.
+5. `rename(tmp, <path>.crypt)`. Then push. A failed push is not fatal; it can be retried with `crygpit push`.
+6. Any failure in steps 2–5 is undone: the project is moved back and the temp dir removed. A journal file in the temp dir allows recovery after a crash (`crygpit init --recover`).
+
+## 10. Ignore Defaults
+
+These are shown at `init` and need confirmation (they can be edited). They're written to the inner `.git/info/exclude`, so the tracked `.gitignore` stays untouched. They affect **untracked files only**; files you already track stay tracked.
+
 ```
-build tar stream:  .crygpit-meta/  +  ignore::Walk(project/, sorted)  +  .crygpit-pad
-   └─► Tee ─┬─► Sha256 (excluding pad)          → change detection (.crygpit/state.toml)
-            └─► gpg --batch --status-fd 3 -e --throw-keyids -r ... -o vault.gpg.tmp
-rename vault.gpg.tmp → vault.gpg   (only if gpg status says success)
+node_modules/  target/  dist/  .next/  .nuxt/  .venv/  venv/  __pycache__/
+*.pyc  .tox/  .mypy_cache/  .pytest_cache/  .gradle/  *.log  .DS_Store
 ```
-- Normalized tar headers (uid/gid 0, empty uname/gname, sorted order) keep the hash stable and avoid leaking local usernames to members.
-- The pad size is computed from the uncompressed tar size, rounded up to the bucket. GPG compression is disabled (`-z 0`), so the padded size maps directly to the ciphertext size.
+Patterns that are sometimes real source (`build/`, `out/`, `vendor/`, `.vscode/`, `.idea/`) are offered as optional.
 
-**Unpack:** `gpg -d` → `tar::Archive`. Rejects absolute paths, `..`, symlinks/hardlinks escaping the target, and unexpected top-level entries.
+## 11. Non-interactive Use
 
-> [!IMPORTANT]
-> **GPG gotcha (verified):** with `--throw-keyids`, `gpg -d` **exits with code 2 even on success**, because it first tries non-matching keys. Crygpit must decide success by parsing `--status-fd` (`DECRYPTION_OKAY` + `GOODMDC`/AEAD OK, and no `DECRYPTION_FAILED`), **not** the exit code.
+- gpg runs through the agent. When there's no TTY, crygpit checks beforehand (`doctor` logic) and fails with a clear message instead of hanging on pinentry.
+- `--yes` / `--accept-members` / `--expect-signer` cover scripted runs explicitly. Nothing security-relevant is accepted by default.
 
-## 9. Architecture
+## 12. Size Limits
 
-Crygpit shells out to `gpg` and `git`, so it works with your keyring, agent, pinentry, YubiKey and SSH setup. Both sit behind traits (`Crypto`, `Vcs`), so native backends can be added later.
+- **Phase 1:** each push writes a **full** segment. If a padded segment would exceed **95 MB** (GitHub rejects 100 MB), push refuses with a message pointing to phase 2 features.
+- **Phase 2:**
+  - **Incremental segments:** `git bundle create - <last-pushed-tips>..` gives `kind = "incremental"`, with a full snapshot every N segments or when the incremental total exceeds X% of a full one.
+  - **Chunking:** segments split into ≤32 MiB parts `NNNNNN.K.gpg`, each signed and encrypted on its own and listed in `meta.toml`.
+  - **`crygpit compact`:** writes a new full segment and deletes older ones from the working tree. An optional history rewrite (orphan branch + force push) needs confirmation and comes with a coordination warning for other members.
+  - **Decoy recipients** to hide the member count.
 
-Crates: `clap`, `serde`, `toml`, `tar`, `ignore`, `sha2`, `rand` (padding), `tempfile`, `anyhow`, `thiserror`, `chrono`; dev: `assert_cmd`, `predicates`.
+## 13. Architecture
+
+Crygpit shells out to `gpg` and `git`, so it works with your keyring, agent, pinentry, YubiKey and SSH setup. Both sit behind traits (`Crypto`, `Vcs`), so native backends could be added later.
+
+Crates: `clap`, `serde`, `toml`, `tar`, `sha2`, `rand`, `tempfile`, `anyhow`, `thiserror`, `chrono`; dev: `assert_cmd`, `predicates`.
 
 ```
 src/
 ├── main.rs  cli.rs
-├── config.rs        meta config + root discovery
-├── members.rs       members.toml, key import/export, validation
-├── state.rs         local state + lock
-├── layout.rs        init move / unwrap
-├── ignore_rules.rs
-├── pack.rs          meta + walk + pad → tar → tee(hash, gpg)
-├── unpack.rs        gpg → tar (traversal guard), list, single extract
-├── gpg.rs           Crypto trait, GnuPG impl, status-fd parser
-├── git.rs           Vcs trait, git CLI impl, anonymized outer commits
-└── commands/        init push clone pull ls extract status member unwrap
+├── paths.rs          root discovery, layout, vault dir discovery
+├── config.rs         config.toml / local.toml
+├── members.rs        members.toml, key export/import (project keyring)
+├── trust.rs          trust.toml: pinning, seq/prev_hash checks, member diff + prompt
+├── state.rs          fingerprint, lock
+├── segment.rs        build/parse segment tar (meta, keys, bundle, Padmé pad)
+├── gpg.rs            Crypto trait, GnuPG impl, status-fd parser (decrypt/verify verdicts)
+├── git.rs            Vcs trait: bundle create/fetch, merge, for-each-ref, anonymized outer commits
+├── sync.rs           push loop, pull, inner merge strategy
+├── init.rs           transactional init + recover, unwrap
+└── commands/         init push clone pull ls extract status member doctor unwrap
 tests/e2e.rs
 ```
 
-## 10. Safety
+## 14. Test Plan (`tests/e2e.rs`)
 
-- `init` refuses if `<path>.crypt` exists, the path is nested in another `.crypt`, the inner repo has a remote (unless `--allow-remote`), or the move would cross filesystems.
-- A lock file prevents concurrent push/pull.
-- The outer repo never contains plaintext (allow-list `.gitignore`, plus a pre-commit check that the staged files are exactly `{.gitignore, vault.gpg}`).
-- Atomic vault write (tmp + rename).
+Each test uses a temp `GNUPGHOME`, keys for Alice, Bob, Carol and Mallory (no passphrase), and a local bare repo standing in for GitHub.
 
-## 11. Test Plan (`tests/e2e.rs`)
+| # | Scenario | Expectation |
+| :- | :--- | :--- |
+| 1 | `init` | Remote contains only `.gitignore` + `vault/000001.gpg`. Project moved. |
+| 2 | Metadata | Empty-keyring `--list-packets` shows only `keyid 0000…`. Outer log has a generic author, message and date. |
+| 3 | Padding | Segment sizes match Padmé buckets. |
+| 4 | Ignores | `node_modules/` and `target/` aren't committed or bundled. A tracked `build/` file **is** included. |
+| 5 | Change detection | `git status` alone → push says "up to date". |
+| 6 | Multi-member | Alice adds Bob. Bob clones (TOFU), commits, pushes. Alice pulls and fast-forwards. |
+| 7 | Concurrent push | Alice and Bob both push from the same base → the second retries, merges inner, succeeds. Outer history is linear. |
+| 8 | Inner conflict | Same line edited by both → push stops with inner merge state. Resolve, re-push. |
+| 9 | Forgery | Mallory (non-member, has remote push access) writes a vault encrypted to Alice and signed by Mallory → rejected. |
+| 10 | Member injection | Bob adds Mallory → Alice's pull shows the diff and needs confirmation. |
+| 11 | Rollback | Old valid segment re-pushed as newest → rejected (seq / prev_hash). |
+| 12 | Hooks | Bob's inner repo has a `post-checkout` hook → it doesn't appear on Alice's machine. |
+| 13 | Removal | Carol removed → can't decrypt the new segment, can still read the old one (documented). |
+| 14 | gpg rc=2 | Multiple local secret keys + `--throw-keyids` → decrypt succeeds via status-fd. |
+| 15 | Transactional init | Failure injected after the move → project restored to its original path. |
+| 16 | Size guard | Payload > 95 MB → push refuses with a clear message. |
+| 17 | `ls` / `extract` | Correct listing and file content; temp dir removed. |
+| 18 | `unwrap` | Original location restored. |
 
-Each test uses a temp `GNUPGHOME`, keys for Alice, Bob and Carol generated with `--quick-gen-key` (no passphrase), and a local bare repo standing in for GitHub.
+## 15. Prior Art
 
-1. `init`: layout created. The bare remote contains exactly `.gitignore` + `vault.gpg`.
-2. Metadata: `gpg --list-packets` with an empty keyring shows only `keyid 0000000000000000`. The outer `git log` has a generic author, message and date.
-3. Padding: vault sizes for small payloads fall into the expected bucket.
-4. Ignores: `node_modules/` and `target/` are absent from `ls`.
-5. Auto-commit: dirty inner → inner commit + outer commit. No change → push skipped.
-6. Multi-member: Alice adds Bob and pushes. Bob clones with only his key, sees the members and Alice's history, commits and pushes. Alice pulls and fast-forwards.
-7. Removal: Alice removes Carol and pushes. Carol can't decrypt HEAD but can still decrypt the previous commit (documents the caveat).
-8. GPG rc=2 case: decrypt with `--throw-keyids` and multiple local secret keys succeeds via status-fd.
-9. Security: a crafted `../evil` entry is rejected.
-10. `unwrap` restores the original location.
+[git-remote-gcrypt](https://spwhitton.name/tech/code/git-remote-gcrypt/) encrypts whole git remotes with gpg and supports multiple participants and hidden recipients. Before implementing, review its manifest and concurrent-push handling. Crygpit's differences: built-in member key distribution with signatures and pinning, rollback protection, padding, anonymous outer commits, and the `.crypt` wrapper / auto-commit / ignore workflow.
 
-## 12. Toolchain
+## 16. Delivery Phases
 
-A stable Rust toolchain exists at `~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/`, but `cargo` is not on PATH. Fix PATH/rustup, or the build will call cargo by its full path.
+1. **Phase 1:** everything above except §12 phase 2 items.
+2. **Phase 2:** incremental segments, chunking, `compact`, decoy recipients.
+
+## 17. Toolchain
+
+A stable Rust toolchain exists at `~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/`, but `cargo` is not on PATH. Fix PATH/rustup, or the build will call cargo by its full path. Requires `gpg` ≥ 2.2 and `git` ≥ 2.30 (checked by `doctor`).
